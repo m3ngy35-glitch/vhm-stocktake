@@ -24,7 +24,7 @@
      detect when a device is running a stale cached copy (see checkForAppUpdate
      in the main script) — this is what makes version mismatches visible
      instead of silently causing "my data isn't there" confusion. -->
-<meta name="app-version" content="2026.11.02.01">
+<meta name="app-version" content="2026.11.02.02">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -3533,6 +3533,16 @@ document.addEventListener('keydown', function(e){
     if(val){
       var match = state.products.find(function(p){ return (p.barcode||'').toLowerCase()===val.toLowerCase() || p.code.toLowerCase()===val.toLowerCase(); });
       if(match){ state.ui.openCode = match.code; state.ui.stSearch=''; renderPage(); }
+      else if(window.__vhmStockMap){
+        // 🔌 not a Stock Take barcode/code — maybe a PokPok label: the VHM Scan map turns it into the product code
+        window.__vhmStockMap.lookup(val).then(function(codes){
+          var have = codes.filter(function(c){ return state.products.some(function(p){ return p.code === slug(c); }); });
+          if(have.length === 1){ state.ui.openCode = slug(have[0]); state.ui.stSearch = ''; renderPage(); toast('PokPok label '+val+' → '+slug(have[0])); }
+          else if(have.length > 1) toast('Label '+val+' is on '+have.join(' and ')+' — scan or type the product code instead', 5000);
+          else if(codes.length && codes.every(function(c){ return !slug(c); })) toast('Label '+val+': its PokPok name does not start with a product code ("'+codes.join(', ')+'") — PokPok person: put the code first in the name', 6000);
+          else if(codes.length) toast('Label '+val+' is '+codes.join(', ')+' — that code is not in Stock Take yet', 5000);
+        });
+      }
     }
   }
   if(e.key==='Enter' && e.target && e.target.id==='passcode-input'){ e.preventDefault(); submitPasscode(); }
@@ -3902,6 +3912,51 @@ setInterval(checkForAppUpdate, 5*60*1000);
   import {
     getStorage, ref, uploadBytes, getDownloadURL
   } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-storage.js";
+  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
+
+  /* 🔌 PokPok labels in the search box: the PokPok ↔ Vrich map from VHM Scan
+     (project vhm-menu, published by its upload page after every PokPok /
+     Vrich upload) turns a PokPok label (P0003955) into its product code
+     (R215). Loaded only when a scan isn't a Stock Take barcode or code, then
+     kept on this device; the small version doc is re-checked at most every
+     10 minutes (1 read), the map itself only when it changed. Reading uses an
+     anonymous sign-in on vhm-menu — the packing phones' read-only access — in
+     a separate Firebase app, so it never touches vhm-data. */
+  window.__vhmStockMap = (function(){
+    var CFG = { apiKey: "AIzaSyCzA--FJTKl74TI0FRhDNGurnOimZjgja0", authDomain: "vhm-menu.firebaseapp.com", projectId: "vhm-menu", storageBucket: "vhm-menu.firebasestorage.app", messagingSenderId: "728781560326", appId: "1:728781560326:web:4f88ffa992cb6175f40187" };
+    var KEY = 'vhm_stocktake_stockmap_v1', idx = null, ver = '', lastCheck = 0, busy = null, sdb = null, sauth = null;
+    function nz(s){ return String(s||'').replace(/[\u200B\u2060\uFEFF\u00AD]/g,'').trim().toUpperCase(); }
+    function build(m){ var x = {}; (m.items||[]).forEach(function(it){ var sale = nz(it[7]); [it[0], it[1], it[6]].forEach(function(k){ k = nz(k); if(!k || !sale) return; (x[k] = x[k] || []); if(x[k].indexOf(sale) < 0) x[k].push(sale); }); }); return x; }
+    // the device copy: just number -> codes (small enough for localStorage)
+    try { var c = JSON.parse(localStorage.getItem(KEY) || 'null'); if(c && c.idx){ idx = c.idx; ver = c.ver || ''; } } catch(e){}
+    function gunzip(u8){
+      if(typeof DecompressionStream === 'function') return new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+      return new Promise(function(res, rej){ var s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js'; s.onload = function(){ res(new TextDecoder().decode(window.pako.ungzip(u8))); }; s.onerror = rej; document.head.appendChild(s); });
+    }
+    async function check(){
+      if(!sdb){ var app = initializeApp(CFG, 'vhm-scan-map'); sauth = getAuth(app); sdb = getFirestore(app); }
+      if(!sauth.currentUser){ await sauth.authStateReady(); if(!sauth.currentUser) await signInAnonymously(sauth); }
+      var ptr = await getDoc(doc(sdb, 'sv2_meta', 'stockmap'));
+      if(!ptr.exists()) return;
+      var p = ptr.data(); if(p.ver === ver && idx) return;
+      var parts = [];
+      for(var i = 0; i < (p.parts||0); i++){ var d = await getDoc(doc(sdb, 'sv2_catalog', 'map_'+p.ver+'_'+i)); if(!d.exists() || d.data().ver !== p.ver) throw new Error('map being published'); parts.push(d.data().data.toUint8Array()); }
+      var all = new Uint8Array(parts.reduce(function(n,x){ return n + x.length; }, 0)), o = 0; parts.forEach(function(x){ all.set(x, o); o += x.length; });
+      var m = JSON.parse(await gunzip(all));
+      if(!m || !Array.isArray(m.items) || m.items.length !== p.count) throw new Error('map incomplete');
+      idx = build(m); ver = p.ver;
+      try { localStorage.setItem(KEY, JSON.stringify({ ver: ver, idx: idx })); } catch(e){}
+    }
+    return {
+      // product codes a scanned number belongs to ([] = unknown). Never rejects.
+      lookup: function(number){
+        var n = nz(number), hit = idx && idx[n];
+        if(hit && Date.now() - lastCheck < 600000) return Promise.resolve(hit);
+        if(!busy){ lastCheck = Date.now(); busy = check().catch(function(e){ console.warn('Stock map check failed', e); }).then(function(){ busy = null; }); }
+        return busy.then(function(){ return (idx && idx[n]) || []; });
+      }
+    };
+  })();
 
   var firebaseConfig = {
     apiKey: "AIzaSyDxF04KvMQUg7kEQw4fFA4U_hiSoMyrUjs",

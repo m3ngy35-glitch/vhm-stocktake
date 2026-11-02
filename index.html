@@ -24,7 +24,7 @@
      detect when a device is running a stale cached copy (see checkForAppUpdate
      in the main script) — this is what makes version mismatches visible
      instead of silently causing "my data isn't there" confusion. -->
-<meta name="app-version" content="2026.09.29.08">
+<meta name="app-version" content="2026.11.02.01">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -770,6 +770,16 @@ function itemsInRange(rangeKey,custom){
    render/event-handler function above works unmodified whether the
    page is backed by Firestore or the local fallback. */
 function makeFirebaseDB(fsdb, mod){
+  /* Read-cost fix (Nov 2026): every write to vhm_stocktake_products gets
+     sync_at = the SERVER's time, so a device can ask "what changed since I
+     last synced" (loadProductsSmart) instead of re-downloading every
+     product whenever anything changed. Done here, in the one place every
+     product write passes through, so no write can forget it. */
+  var hasTs = !!(mod.serverTimestamp && mod.Timestamp);
+  function stamp(path, data){
+    if(hasTs && /^vhm_stocktake_products\//.test(path) && data && typeof data === 'object') return Object.assign({}, data, { sync_at: mod.serverTimestamp() });
+    return data;
+  }
   function wrapDocSnap(snap){ return { id:snap.id, exists:snap.exists(), data:function(){ return snap.data(); } }; }
   function wrapQuerySnap(qs){
     var docs = qs.docs.map(function(d){ return { id:d.id, exists:true, data:function(){ return d.data(); } }; });
@@ -779,8 +789,8 @@ function makeFirebaseDB(fsdb, mod){
     return {
       id: ref.id, path: ref.path,
       get: function(){ return mod.getDoc(ref).then(wrapDocSnap); },
-      set: function(data){ return mod.setDoc(ref, data); },
-      update: function(data){ return mod.updateDoc(ref, data); },
+      set: function(data){ return mod.setDoc(ref, stamp(ref.path, data)); },
+      update: function(data){ return mod.updateDoc(ref, stamp(ref.path, data)); },
       delete: function(){ return mod.deleteDoc(ref); },
       onSnapshot: function(next, error){ return mod.onSnapshot(ref, function(snap){ next(wrapDocSnap(snap)); }, error); },
       collection: function(sub){ return collRef(ref.path+'/'+sub, []); }
@@ -793,7 +803,7 @@ function makeFirebaseDB(fsdb, mod){
     return {
       path: path,
       doc: function(id){ var ref = id ? mod.doc(fsdb, path+'/'+id) : mod.doc(colRef); return docRefFromNative(ref); },
-      add: function(data){ return mod.addDoc(colRef, data).then(docRefFromNative); },
+      add: function(data){ return mod.addDoc(colRef, stamp(path+'/x', data)).then(docRefFromNative); },
       where: function(f,op,v){ return collRef(path, constraints.concat([mod.where(f,op,v)])); },
       orderBy: function(f,dir){ return collRef(path, constraints.concat([mod.orderBy(f, dir||'asc')])); },
       limit: function(n){ return collRef(path, constraints.concat([mod.limit(n)])); },
@@ -801,7 +811,15 @@ function makeFirebaseDB(fsdb, mod){
       onSnapshot: function(next, error){ return mod.onSnapshot(buildQuery(), function(qs){ next(wrapQuerySnap(qs)); }, error); }
     };
   }
-  return { doc: function(path){ return docRefFromNative(mod.doc(fsdb, path)); }, collection: function(path){ return collRef(path, []); } };
+  var api = { doc: function(path){ return docRefFromNative(mod.doc(fsdb, path)); }, collection: function(path){ return collRef(path, []); } };
+  if(hasTs){
+    api.ts = function(ms){ return mod.Timestamp.fromMillis(ms); };          // a time for where('sync_at','>',…)
+    api.serverTs = function(){ return mod.serverTimestamp(); };
+    api.deleteField = function(){ return mod.deleteField(); };
+    // write only the given top-level fields of one document (other fields untouched)
+    api.mergeDoc = function(path, fields){ return mod.setDoc(mod.doc(fsdb, path), fields, { merge:true }); };
+  }
+  return api;
 }
 window.__vhmMakeFirebaseAdapter = makeFirebaseDB;
 
@@ -901,15 +919,77 @@ var PRODUCTS_CACHE_KEY = 'vhm_stocktake_products_cache_v1';
 function readProductsCache(){
   try { return JSON.parse(localStorage.getItem(PRODUCTS_CACHE_KEY) || 'null'); } catch(e){ return null; }
 }
+/* Read-cost fix (Nov 2026) — "only download what changed".
+   The old check (1 read: the newest updated_at) was cheap only while nothing
+   changed; with 200+ codes created a day, almost every open found a change
+   and re-downloaded EVERY product row (one document per size/colour). Now,
+   on Firestore, this device keeps its list and asks only for rows whose
+   sync_at (server time, stamped by the adapter on every product write) is
+   newer than the newest one it has, plus one small document listing deleted
+   rows. A full re-read happens once a week, or when Settings > Clear all
+   data was used. The on-device fallback store keeps the old logic. */
+var PRODUCTS_FULL_EVERY_MS = 7*864e5, TOMBSTONE_KEEP_MS = 30*864e5;
+var productsSync = { syncMs:0, fullAt:0 };
+function tsMillis(v){
+  if(!v) return 0;
+  if(typeof v.toMillis === 'function') return v.toMillis();
+  if(typeof v === 'number') return v;
+  if(typeof v.seconds === 'number') return v.seconds*1000 + Math.floor((v.nanoseconds||0)/1e6);   // a Timestamp after a trip through localStorage
+  return 0;
+}
 function writeProductsCache(products, version){
-  try { localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify({version: version||Date.now(), products: products})); } catch(e){}
+  try { localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify({v:2, version: version||Date.now(), products: products, syncMs: productsSync.syncMs, fullAt: productsSync.fullAt})); } catch(e){}
 }
 // Call after any local write that changes state.products, so this device's
 // own cache stays current without needing to ask Firestore again.
 function refreshProductsCacheFromState(){ writeProductsCache(state.products, Date.now()); }
-function clearProductsCache(){ try { localStorage.removeItem(PRODUCTS_CACHE_KEY); } catch(e){} }
+function clearProductsCache(){ try { localStorage.removeItem(PRODUCTS_CACHE_KEY); } catch(e){} productsSync = { syncMs:0, fullAt:0 }; }
 function loadProductsSmart(){
   var col = state.db.collection('vhm_stocktake_products');
+  if(!state.db.ts) return loadProductsByVersion(col);
+  var cache = readProductsCache();
+  function full(){
+    productsSync = { syncMs:1, fullAt: Date.now() };
+    return col.get().then(function(qs){
+      state.products = qs.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+      state.products.forEach(function(p){ productsSync.syncMs = Math.max(productsSync.syncMs, tsMillis(p.sync_at)); });
+      writeProductsCache(state.products);
+    });
+  }
+  if(!(cache && cache.v === 2 && cache.syncMs && Array.isArray(cache.products) && Date.now() - (cache.fullAt||0) < PRODUCTS_FULL_EVERY_MS)) return full();
+  productsSync = { syncMs: cache.syncMs, fullAt: cache.fullAt };
+  return Promise.all([
+    col.where('sync_at','>', state.db.ts(cache.syncMs - 1)).get(),
+    state.db.collection('vhm_stocktake_meta').doc('deleted_products').get()
+  ]).then(function(r){
+    var del = r[1].exists ? (r[1].data() || {}) : {};
+    if(del.__reset && tsMillis(del.__reset) >= cache.syncMs) return full();       // "Clear all data" since this device last synced
+    var byId = {};
+    cache.products.forEach(function(p){ byId[p.id] = p; });
+    r[0].docs.forEach(function(d){ var x = Object.assign({id:d.id}, d.data()); byId[d.id] = x; productsSync.syncMs = Math.max(productsSync.syncMs, tsMillis(x.sync_at)); });
+    var old = {}, cut = productsSync.syncMs - TOMBSTONE_KEEP_MS;
+    Object.keys(del).forEach(function(id){
+      if(id === '__reset') return;
+      var t = tsMillis(del[id]);
+      if(byId[id] && tsMillis(byId[id].sync_at) < t) delete byId[id];               // deleted after this row was last written (not re-created since)
+      if(t && t < cut) old[id] = state.db.deleteField();
+    });
+    if(Object.keys(old).length) state.db.mergeDoc('vhm_stocktake_meta/deleted_products', old).catch(function(){});   // tidy markers older than 30 days
+    state.products = Object.keys(byId).map(function(id){ return byId[id]; });
+    writeProductsCache(state.products);
+  }, function(err){
+    console.error('Changed-products check failed, falling back to a full read', err);
+    return full();
+  });
+}
+// Rows deleted on this device: one small write so other devices drop them on their next sync
+function markProductsDeleted(ids){
+  if(!state.db.mergeDoc || !ids.length) return Promise.resolve();
+  var f = {}; ids.forEach(function(id){ f[id] = state.db.serverTs(); });
+  return state.db.mergeDoc('vhm_stocktake_meta/deleted_products', f).catch(function(e){ console.error('Delete marker failed', e); });
+}
+// The old check, kept for the on-device fallback store (no Firestore, no read cost)
+function loadProductsByVersion(col){
   return col.orderBy('updated_at','desc').limit(1).get().then(function(qs){
     var latestVersion = qs.empty ? 0 : (qs.docs[0].data().updated_at || 0);
     var cache = readProductsCache();
@@ -976,12 +1056,62 @@ function loadAllData(){
     scheduleRender();
   });
 }
+/* Read-cost fix (Nov 2026): on Firestore, code status (Done / recount /
+   VRich / Popok ticks) is kept in 4 documents in vhm_stocktake_meta
+   (code_status_0..3, each code → its status as JSON text) instead of one
+   document per code — opening the app reads 4 documents instead of one per
+   code, and the live view watches 4 documents. Each code is its own field,
+   written with merge, so two phones marking different codes at the same time
+   never overwrite each other. The first open of this version copies the old
+   vhm_stocktake_code_status documents over once (marker __migrated on
+   code_status_0). The on-device fallback store keeps the old layout. */
+var CS_SHARDS = 4;
+function csBundled(){ return !!(state.db && state.db.mergeDoc); }
+function csDocId(code){ var h = 0; code = String(code); for(var i=0;i<code.length;i++){ h = (h*31 + code.charCodeAt(i)) | 0; } return 'code_status_' + (Math.abs(h) % CS_SHARDS); }
+function csWrite(code, data){             // data === null removes the code's status
+  if(!csBundled()){
+    var r = state.db.collection('vhm_stocktake_code_status').doc(code);
+    return data === null ? r.delete() : r.set(data);
+  }
+  var f = {}; f[code] = data === null ? state.db.deleteField() : JSON.stringify(data);
+  return state.db.mergeDoc('vhm_stocktake_meta/' + csDocId(code), f);
+}
+function csFromDocs(datas){
+  var out = {};
+  datas.forEach(function(d){ Object.keys(d || {}).forEach(function(code){
+    if(code.indexOf('__') === 0) return;
+    var v = d[code];
+    if(typeof v === 'string'){ try { out[code] = JSON.parse(v); } catch(e){} } else if(v && typeof v === 'object') out[code] = v;
+  }); });
+  return out;
+}
+function csShardIds(){ var a = []; for(var i=0;i<CS_SHARDS;i++) a.push('code_status_' + i); return a; }
 function fetchCodeStatusOnce(){
-  return state.db.collection('vhm_stocktake_code_status').get().then(function(qs){
-    var fresh = {};
-    qs.docs.forEach(function(d){ fresh[d.id] = d.data(); });
-    state.codeStatus = fresh;
-  }, function(err){
+  if(!csBundled()){
+    return state.db.collection('vhm_stocktake_code_status').get().then(function(qs){
+      var fresh = {};
+      qs.docs.forEach(function(d){ fresh[d.id] = d.data(); });
+      state.codeStatus = fresh;
+    }, function(err){
+      console.error('Code status read failed', err);
+      state.codeStatus = state.codeStatus || {};
+    });
+  }
+  var meta = state.db.collection('vhm_stocktake_meta');
+  return Promise.all(csShardIds().map(function(id){ return meta.doc(id).get(); })).then(function(snaps){
+    var datas = snaps.map(function(sn){ return sn.exists ? (sn.data() || {}) : {}; });
+    if(datas[0].__migrated){ state.codeStatus = csFromDocs(datas); return; }
+    // one-time copy of the old one-document-per-code statuses (a status already in the new documents wins)
+    return state.db.collection('vhm_stocktake_code_status').get().then(function(qs){
+      var have = csFromDocs(datas), add = {};
+      csShardIds().forEach(function(id){ add[id] = {}; });
+      qs.docs.forEach(function(d){ if(!have[d.id]){ add[csDocId(d.id)][d.id] = JSON.stringify(d.data()); have[d.id] = d.data(); } });
+      add.code_status_0.__migrated = Date.now();
+      return Promise.all(csShardIds().map(function(id){ return state.db.mergeDoc('vhm_stocktake_meta/' + id, add[id]); })).then(function(){
+        state.codeStatus = have;
+      });
+    });
+  }).catch(function(err){
     console.error('Code status read failed', err);
     state.codeStatus = state.codeStatus || {};
   });
@@ -990,6 +1120,25 @@ var codeStatusUnsub = null;
 function watchCodeStatus(onFirst){
   if(codeStatusUnsub){ if(onFirst) onFirst(); return; } // already watching
   var first = true;
+  if(csBundled()){
+    var ids = csShardIds(), datas = ids.map(function(){ return null; }), unsubs;
+    var onErr = function(err){
+      console.error('Code status live sync failed — falling back to Refresh-only updates', err);
+      state.codeStatus = state.codeStatus || {};
+      if(first){ first = false; if(onFirst) onFirst(); }
+    };
+    unsubs = ids.map(function(id, i){
+      return state.db.collection('vhm_stocktake_meta').doc(id).onSnapshot(function(sn){
+        datas[i] = sn.exists ? (sn.data() || {}) : {};
+        if(datas.some(function(d){ return d === null; })) return;      // wait until all 4 have arrived once
+        state.codeStatus = csFromDocs(datas);
+        if(first){ first = false; if(onFirst) onFirst(); }
+        else scheduleRender();
+      }, onErr);
+    });
+    codeStatusUnsub = function(){ unsubs.forEach(function(u){ try { u(); } catch(e){} }); };
+    return;
+  }
   codeStatusUnsub = state.db.collection('vhm_stocktake_code_status').onSnapshot(function(qs){
     var fresh = {};
     qs.docs.forEach(function(d){ fresh[d.id] = d.data(); });
@@ -1455,7 +1604,7 @@ function writePendingStatusQueue(q){ try { localStorage.setItem(PENDING_STATUS_K
 function queuePendingStatus(code, data){ var q=readPendingStatusQueue(); q[code]=data; writePendingStatusQueue(q); }
 function clearPendingStatus(code){ var q=readPendingStatusQueue(); delete q[code]; writePendingStatusQueue(q); }
 function syncCodeStatus(code, data, failMsg){
-  return state.db.collection('vhm_stocktake_code_status').doc(code).set(data).then(function(){
+  return csWrite(code, data).then(function(){
     clearPendingStatus(code);
   }).catch(function(e){
     console.error('Could not sync status for '+code, e);
@@ -1479,7 +1628,7 @@ function flushPendingStatus(){
       return;
     }
     state.codeStatus[code] = queued;
-    state.db.collection('vhm_stocktake_code_status').doc(code).set(queued).then(function(){
+    csWrite(code, queued).then(function(){
       clearPendingStatus(code);
       scheduleRender();
     }).catch(function(){ /* still offline — leave queued, try again next time */ });
@@ -3472,6 +3621,7 @@ function resetAllData(){
   })).then(function(){
     state.products=[]; state.stocktakes=[]; state.items=[]; state.ui.activeStocktakeId=null;
     clearProductsCache();
+    if(state.db.mergeDoc) state.db.mergeDoc('vhm_stocktake_meta/deleted_products', { __reset: state.db.serverTs() }).catch(function(){});
     toast('All product and stock-take data cleared');
     renderPage();
   });
@@ -3660,7 +3810,8 @@ function deleteProductCode(code){
   var variants = productsForCode(code);
   var col = state.db.collection('vhm_stocktake_products');
   variants.reduce(function(p,v){ return p.then(function(){ return col.doc(v.id).delete(); }); }, Promise.resolve())
-    .then(function(){ return state.db.collection('vhm_stocktake_code_status').doc(code).delete().catch(function(){}); })
+    .then(function(){ return markProductsDeleted(variants.map(function(v){ return v.id; })); })
+    .then(function(){ return csWrite(code, null).catch(function(){}); })
     .then(function(){
       state.products = state.products.filter(function(p){ return p.code!==code; });
       delete state.codeStatus[code];
@@ -3745,7 +3896,8 @@ setInterval(checkForAppUpdate, 5*60*1000);
   import {
     getFirestore,
     collection, doc, setDoc, updateDoc, deleteDoc, addDoc,
-    getDoc, getDocs, onSnapshot, query, where, orderBy, limit
+    getDoc, getDocs, onSnapshot, query, where, orderBy, limit,
+    serverTimestamp, Timestamp, deleteField
   } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
   import {
     getStorage, ref, uploadBytes, getDownloadURL
@@ -3779,7 +3931,7 @@ setInterval(checkForAppUpdate, 5*60*1000);
     // vhmPendingStatusQueue below), which is effectively instant to read and
     // write and only touches the one collection that actually needs it.
     var fsdb = getFirestore(app);
-    var mod = { collection:collection, doc:doc, setDoc:setDoc, updateDoc:updateDoc, deleteDoc:deleteDoc, addDoc:addDoc, getDoc:getDoc, getDocs:getDocs, onSnapshot:onSnapshot, query:query, where:where, orderBy:orderBy, limit:limit };
+    var mod = { collection:collection, doc:doc, setDoc:setDoc, updateDoc:updateDoc, deleteDoc:deleteDoc, addDoc:addDoc, getDoc:getDoc, getDocs:getDocs, onSnapshot:onSnapshot, query:query, where:where, orderBy:orderBy, limit:limit, serverTimestamp:serverTimestamp, Timestamp:Timestamp, deleteField:deleteField };
     var dbAdapter = window.__vhmMakeFirebaseAdapter(fsdb, mod);
 
     var storageAdapter = null;

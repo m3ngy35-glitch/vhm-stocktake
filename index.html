@@ -1266,11 +1266,26 @@ function clearCodeToZero(code, st, staff){
     return saveItem(st.id, v, 0, staff, 'stockcheck');
   }));
 }
+// The totals are a summary of the items (recomputed from them at any time), so
+// while staff count cell after cell they are written once things go quiet
+// (3 s after the last save, or when the page is hidden) instead of once per
+// cell — counting a 50-cell code was 50 extra writes, now it's 1.
+var totalsTimers = {}, TOTALS_DELAY = 3000, catSaveTimer = 0;
+function writeStocktakeTotals(stId){
+  clearTimeout(totalsTimers[stId]); delete totalsTimers[stId];
+  var totals = recomputeStocktakeTotals(stId);
+  return state.db.collection('vhm_stocktake_stocktakes').doc(stId).update({totals:totals}).catch(function(){});
+}
+function flushStocktakeTotals(){ Object.keys(totalsTimers).forEach(writeStocktakeTotals); }
+if(typeof document!=='undefined') document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='hidden') flushStocktakeTotals(); });
+if(typeof window!=='undefined') window.addEventListener('pagehide', flushStocktakeTotals);
 function refreshStocktakeTotals(stId){
   var totals = recomputeStocktakeTotals(stId);
   var idx = state.stocktakes.findIndex(function(s){return s.id===stId;});
   if(idx>-1) state.stocktakes[idx] = Object.assign({}, state.stocktakes[idx], {totals:totals});
-  return state.db.collection('vhm_stocktake_stocktakes').doc(stId).update({totals:totals}).catch(function(){});
+  clearTimeout(totalsTimers[stId]);
+  totalsTimers[stId] = setTimeout(function(){ writeStocktakeTotals(stId); }, TOTALS_DELAY);
+  return Promise.resolve();
 }
 // Guards against two stock takes running at once, which is how the same
 // code ends up counted twice under two different stocktake_ids: e.g. this
@@ -1321,9 +1336,9 @@ function startStocktake(category){
   });
 }
 function completeStocktake(stId){
-  return refreshStocktakeTotals(stId).then(function(){
-    return state.db.collection('vhm_stocktake_stocktakes').doc(stId).update({status:'completed', completed_at:Date.now()});
-  }).then(function(){
+  refreshStocktakeTotals(stId);                                   // local totals now…
+  clearTimeout(totalsTimers[stId]); delete totalsTimers[stId];    // …and written together with the status below (1 write)
+  return state.db.collection('vhm_stocktake_stocktakes').doc(stId).update({totals:recomputeStocktakeTotals(stId), status:'completed', completed_at:Date.now()}).then(function(){
     var idx = state.stocktakes.findIndex(function(s){return s.id===stId;});
     if(idx>-1) state.stocktakes[idx] = Object.assign({}, state.stocktakes[idx], {status:'completed', completed_at:Date.now()});
     state.ui.activeStocktakeId = null;
@@ -3195,7 +3210,8 @@ document.addEventListener('click', function(e){
   }
 
   var catTab = t.closest('[data-cat-tab]'); if(catTab){
-    var st = activeStocktake(); if(st){ st.category = catTab.getAttribute('data-cat-tab'); state.db.collection('vhm_stocktake_stocktakes').doc(st.id).update({category:st.category}).catch(function(){}); renderPage(); }
+    // the chosen tab is remembered online, but only once staff stop on a tab (tapping through tabs wrote once per tap)
+    var st = activeStocktake(); if(st){ var cat = catTab.getAttribute('data-cat-tab'); if(cat !== st.category){ st.category = cat; clearTimeout(catSaveTimer); catSaveTimer = setTimeout(function(){ state.db.collection('vhm_stocktake_stocktakes').doc(st.id).update({category:st.category}).catch(function(){}); }, 1500); } renderPage(); }
     return;
   }
   var recountBtn = t.closest('[data-activate-recount]'); if(recountBtn){
